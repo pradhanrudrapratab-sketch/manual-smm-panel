@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: manual-smm-panel
+    runtime: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    disk:
+      name: smm-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_PATH
+        value: /var/data/db.sqlite
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: FAMAPI_API_KEY
+        sync: false
+      - key: FAMAPI_BASE_URL
+        value: https://mrkrishna.site/api/v1
+      - key: FAMAPI_AMOUNT_MULTIPLIER
+        value: "100"
+      - key: PUBLIC_BASE_URL
+        sync: false
