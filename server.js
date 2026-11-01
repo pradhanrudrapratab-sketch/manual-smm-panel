@@ -20,7 +20,9 @@ db.pragma("foreign_keys = ON");
 db.exec(`
 CREATE TABLE IF NOT EXISTS users (
  id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
- password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'customer', created_at TEXT DEFAULT CURRENT_TIMESTAMP
+ password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'customer',
+ permissions TEXT NOT NULL DEFAULT '{}', is_active INTEGER NOT NULL DEFAULT 1,
+ created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS services (
  id INTEGER PRIMARY KEY AUTOINCREMENT, category TEXT NOT NULL, name TEXT NOT NULL,
@@ -41,11 +43,54 @@ CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 `);
 
-const count = db.prepare("SELECT COUNT(*) n FROM users WHERE role='admin'").get().n;
+// Safe, repeatable migrations for existing databases.
+for (const sql of [
+  "ALTER TABLE users ADD COLUMN permissions TEXT NOT NULL DEFAULT '{}'",
+  "ALTER TABLE users ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1"
+]) {
+  try { db.exec(sql); }
+  catch (e) {
+    if (!String(e.message).includes("duplicate column")) throw e;
+  }
+}
+
+const DEFAULT_PERMISSIONS = {
+  customer: [],
+  admin: ["orders.manage", "services.manage"],
+  semi_super_admin: ["users.view", "orders.manage", "services.manage"],
+  super_admin: ["*"]
+};
+
+function parsePermissions(value) {
+  try {
+    const parsed = JSON.parse(value || "[]");
+    return Array.isArray(parsed) ? parsed : [];
+  } catch { return []; }
+}
+
+// Environment credentials establish the one protected Super Admin.
+const superEmail = String(process.env.SUPER_ADMIN_EMAIL || process.env.ADMIN_EMAIL || "").trim().toLowerCase();
+const superPassword = process.env.SUPER_ADMIN_PASSWORD || process.env.ADMIN_PASSWORD || "";
+
+if (superEmail && superPassword) {
+  const existing = db.prepare("SELECT id FROM users WHERE email=?").get(superEmail);
+  const hash = bcrypt.hashSync(superPassword, 12);
+  if (existing) {
+    db.prepare("UPDATE users SET role='super_admin',password_hash=?,is_active=1,permissions=? WHERE id=?")
+      .run(hash, JSON.stringify(DEFAULT_PERMISSIONS.super_admin), existing.id);
+  } else {
+    db.prepare("INSERT INTO users(name,email,password_hash,role,permissions) VALUES(?,?,?,'super_admin',?)")
+      .run("Super Administrator", superEmail, hash, JSON.stringify(DEFAULT_PERMISSIONS.super_admin));
+  }
+} else {
+  console.warn("WARNING: Set SUPER_ADMIN_EMAIL and SUPER_ADMIN_PASSWORD in Render environment variables.");
+}
+
+const count = db.prepare("SELECT COUNT(*) n FROM users WHERE role IN ('admin','super_admin')").get().n;
 if (!count && process.env.ADMIN_EMAIL && process.env.ADMIN_PASSWORD) {
   const hash = bcrypt.hashSync(process.env.ADMIN_PASSWORD, 12);
-  db.prepare("INSERT OR IGNORE INTO users(name,email,password_hash,role) VALUES(?,?,?,'admin')")
-    .run("Administrator", process.env.ADMIN_EMAIL.toLowerCase(), hash);
+  db.prepare("INSERT OR IGNORE INTO users(name,email,password_hash,role,permissions) VALUES(?,?,?,'admin',?)")
+    .run("Administrator", process.env.ADMIN_EMAIL.toLowerCase(), hash, JSON.stringify(DEFAULT_PERMISSIONS.admin));
 }
 if (db.prepare("SELECT COUNT(*) n FROM services").get().n === 0) {
   const seed = db.prepare(`INSERT INTO services(category,name,description,link_label,price_per_1000,min_quantity,max_quantity)
@@ -59,18 +104,49 @@ app.set("trust proxy", 1);
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(express.json({ limit: "30kb" }));
 app.use(express.urlencoded({ extended: false }));
+if (process.env.NODE_ENV === "production" && !process.env.SESSION_SECRET) {
+  throw new Error("SESSION_SECRET must be set in production.");
+}
 app.use(session({
+  name: "sf.sid",
   store: new SQLiteStore({ db: "sessions.sqlite", dir: path.dirname(path.resolve(DB_PATH)) }),
-  secret: process.env.SESSION_SECRET || "development-only-change-me",
-  resave: false, saveUninitialized: false,
-  cookie: { httpOnly: true, sameSite: "lax", secure: process.env.NODE_ENV === "production", maxAge: 7*24*60*60*1000 }
+  secret: process.env.SESSION_SECRET || "local-development-secret-change-this",
+  resave: false, saveUninitialized: false, rolling: true,
+  cookie: {
+    httpOnly: true, sameSite: "lax",
+    secure: process.env.NODE_ENV === "production",
+    path: "/", maxAge: 30*24*60*60*1000
+  }
 }));
 app.use(express.static(path.join(__dirname, "public")));
 app.use("/api/", rateLimit({ windowMs: 60*1000, limit: 120, standardHeaders: true, legacyHeaders: false }));
 
-const safeUser = u => ({ id:u.id, name:u.name, email:u.email, role:u.role });
-function auth(req,res,next){ if(!req.session.user) return res.status(401).json({error:"Please log in."}); next(); }
-function admin(req,res,next){ if(!req.session.user || req.session.user.role!=="admin") return res.status(403).json({error:"Admin access required."}); next(); }
+const safeUser = u => ({
+  id: u.id, name: u.name, email: u.email, role: u.role,
+  permissions: u.role === "super_admin" ? ["*"] : parsePermissions(u.permissions)
+});
+function auth(req,res,next) {
+  if (!req.session.user) return res.status(401).json({error:"Please log in."});
+  const u = db.prepare("SELECT id,name,email,role,permissions,is_active FROM users WHERE id=?").get(req.session.user.id);
+  if (!u || !u.is_active) {
+    return req.session.destroy(() => res.status(401).json({error:"Your account is disabled. Contact the administrator."}));
+  }
+  req.session.user = safeUser(u);
+  next();
+}
+function permit(permission) {
+  return (req,res,next) => {
+    if (!req.session.user) return res.status(401).json({error:"Please log in."});
+    const permissions = req.session.user.permissions || [];
+    if (req.session.user.role === "super_admin" || permissions.includes("*") || permissions.includes(permission)) return next();
+    return res.status(403).json({error:"You do not have permission to perform this action."});
+  };
+}
+const admin = permit("orders.manage");
+const superAdmin = (req,res,next) => {
+  if (req.session.user && req.session.user.role === "super_admin") return next();
+  return res.status(403).json({error:"Super Admin access required."});
+};
 function validUrl(v){ try { const u=new URL(v); return ["http:","https:"].includes(u.protocol); } catch { return false; } }
 function famapiHeaders(){ return { "Authorization":`Bearer ${process.env.FAMAPI_API_KEY || ""}`, "Content-Type":"application/json" }; }
 
@@ -83,17 +159,40 @@ app.post("/api/register", async (req,res)=>{
   try{
     const hash=await bcrypt.hash(password,12);
     const info=db.prepare("INSERT INTO users(name,email,password_hash) VALUES(?,?,?)").run(name.trim(),email.trim().toLowerCase(),hash);
-    const u=db.prepare("SELECT id,name,email,role FROM users WHERE id=?").get(info.lastInsertRowid);
-    req.session.user=safeUser(u); res.json({user:req.session.user});
+    const u=db.prepare("SELECT id,name,email,role,permissions FROM users WHERE id=?").get(info.lastInsertRowid);
+    req.session.regenerate(err => {
+      if (err) return res.status(500).json({error:"Could not start session."});
+      req.session.user=safeUser(u);
+      req.session.save(saveErr => {
+        if (saveErr) return res.status(500).json({error:"Could not save session."});
+        res.json({user:req.session.user});
+      });
+    });
   }catch(e){res.status(409).json({error:"That email may already be registered."});}
 });
 app.post("/api/login", async (req,res)=>{
   const {email,password}=req.body||{};
   const u=db.prepare("SELECT * FROM users WHERE email=?").get(String(email||"").toLowerCase().trim());
-  if(!u || !(await bcrypt.compare(password||"",u.password_hash))) return res.status(401).json({error:"Invalid email or password."});
-  req.session.regenerate(err=>{ if(err)return res.status(500).json({error:"Could not start session."}); req.session.user=safeUser(u); res.json({user:req.session.user}); });
+  if(!u || !u.is_active || !(await bcrypt.compare(password||"",u.password_hash))) return res.status(401).json({error:"Invalid email or password."});
+  req.session.regenerate(err => {
+    if (err) return res.status(500).json({error:"Could not start session."});
+    req.session.user = safeUser(u);
+    req.session.save(saveErr => {
+      if (saveErr) return res.status(500).json({error:"Could not save session."});
+      res.json({user:req.session.user});
+    });
+  });
 });
-app.post("/api/logout",(req,res)=>req.session.destroy(()=>res.json({ok:true})));
+app.post("/api/logout",(req,res)=>{
+  req.session.destroy(err => {
+    res.clearCookie("sf.sid", {
+      httpOnly:true, sameSite:"lax",
+      secure:process.env.NODE_ENV === "production", path:"/"
+    });
+    if (err) return res.status(500).json({error:"Could not log out."});
+    res.json({ok:true});
+  });
+});
 
 app.get("/api/services",(req,res)=>{
   const rows=db.prepare("SELECT id,category,name,description,link_label,price_per_1000,min_quantity,max_quantity FROM services WHERE active=1 ORDER BY category,name").all();
@@ -148,7 +247,9 @@ app.post("/api/orders/:id/verify",auth,async(req,res)=>{
   }catch(e){res.status(502).json({error:"Unable to verify payment right now. Please retry."});}
 });
 app.get("/api/orders",auth,(req,res)=>{
-  const rows=req.session.user.role==="admin"
+  const canManage = req.session.user.role === "super_admin" ||
+    (req.session.user.permissions || []).includes("orders.manage");
+  const rows = canManage
     ? db.prepare("SELECT o.*,u.name customer_name,u.email customer_email FROM orders o JOIN users u ON u.id=o.user_id ORDER BY o.id DESC LIMIT 500").all()
     : db.prepare("SELECT * FROM orders WHERE user_id=? ORDER BY id DESC").all(req.session.user.id);
   res.json({orders:rows});
@@ -161,8 +262,8 @@ app.patch("/api/admin/orders/:id",admin,(req,res)=>{
   if(!info.changes)return res.status(404).json({error:"Paid order not found."});
   res.json({ok:true});
 });
-app.get("/api/admin/services",admin,(req,res)=>res.json({services:db.prepare("SELECT * FROM services ORDER BY id DESC").all()}));
-app.post("/api/admin/services",admin,(req,res)=>{
+app.get("/api/admin/services",permit("services.manage"),(req,res)=>res.json({services:db.prepare("SELECT * FROM services ORDER BY id DESC").all()}));
+app.post("/api/admin/services",permit("services.manage"),(req,res)=>{
   const b=req.body||{};
   if(!b.category||!b.name||!b.link_label||!Number.isFinite(Number(b.price_per_1000))||Number(b.price_per_1000)<=0)
     return res.status(400).json({error:"Category, service name, link label and valid price are required."});
@@ -170,14 +271,60 @@ app.post("/api/admin/services",admin,(req,res)=>{
     VALUES(?,?,?,?,?,?,?,1)`).run(b.category,b.name,b.description||"",b.link_label,Number(b.price_per_1000),Number(b.min_quantity)||1,Number(b.max_quantity)||100000);
   res.json({id:info.lastInsertRowid});
 });
-app.patch("/api/admin/services/:id",admin,(req,res)=>{
+app.patch("/api/admin/services/:id",permit("services.manage"),(req,res)=>{
   const b=req.body||{};
   db.prepare(`UPDATE services SET category=?,name=?,description=?,link_label=?,price_per_1000=?,min_quantity=?,max_quantity=?,active=? WHERE id=?`)
     .run(b.category,b.name,b.description||"",b.link_label,Number(b.price_per_1000),Number(b.min_quantity),Number(b.max_quantity),b.active?1:0,Number(req.params.id));
   res.json({ok:true});
 });
-app.delete("/api/admin/services/:id",admin,(req,res)=>{
+app.delete("/api/admin/services/:id",permit("services.manage"),(req,res)=>{
   db.prepare("UPDATE services SET active=0 WHERE id=?").run(Number(req.params.id)); res.json({ok:true});
 });
+
+// User management is restricted to the Super Admin.
+app.get("/api/admin/users",auth,superAdmin,(req,res)=>{
+  const users = db.prepare("SELECT id,name,email,role,permissions,is_active,created_at FROM users ORDER BY id DESC").all()
+    .map(u => ({...u, permissions:parsePermissions(u.permissions), is_active:!!u.is_active}));
+  res.json({users});
+});
+
+app.patch("/api/admin/users/:id/role",auth,superAdmin,(req,res)=>{
+  const id = Number(req.params.id);
+  const role = String(req.body.role || "");
+  if (!Number.isInteger(id) || !["customer","admin","semi_super_admin"].includes(role))
+    return res.status(400).json({error:"Invalid user or role."});
+  const target = db.prepare("SELECT id,role FROM users WHERE id=?").get(id);
+  if (!target) return res.status(404).json({error:"User not found."});
+  if (target.role === "super_admin") return res.status(403).json({error:"Super Admin accounts cannot be changed here."});
+  db.prepare("UPDATE users SET role=?,permissions=? WHERE id=?")
+    .run(role,JSON.stringify(DEFAULT_PERMISSIONS[role]),id);
+  res.json({ok:true});
+});
+
+app.patch("/api/admin/users/:id/permissions",auth,superAdmin,(req,res)=>{
+  const id = Number(req.params.id);
+  const permissions = req.body.permissions;
+  if (!Number.isInteger(id) || !Array.isArray(permissions) ||
+      !permissions.every(x => ["orders.manage","services.manage","users.view"].includes(x)))
+    return res.status(400).json({error:"Invalid permissions."});
+  const target = db.prepare("SELECT role FROM users WHERE id=?").get(id);
+  if (!target) return res.status(404).json({error:"User not found."});
+  if (target.role === "super_admin") return res.status(403).json({error:"Super Admin permissions are protected."});
+  db.prepare("UPDATE users SET permissions=? WHERE id=?").run(JSON.stringify([...new Set(permissions)]),id);
+  res.json({ok:true});
+});
+
+app.patch("/api/admin/users/:id/status",auth,superAdmin,(req,res)=>{
+  const id = Number(req.params.id);
+  const active = req.body.active;
+  if (!Number.isInteger(id) || typeof active !== "boolean")
+    return res.status(400).json({error:"Invalid account status."});
+  const target = db.prepare("SELECT id,role FROM users WHERE id=?").get(id);
+  if (!target) return res.status(404).json({error:"User not found."});
+  if (target.role === "super_admin") return res.status(403).json({error:"Super Admin accounts cannot be disabled here."});
+  db.prepare("UPDATE users SET is_active=? WHERE id=?").run(active ? 1 : 0,id);
+  res.json({ok:true});
+});
+
 app.get("*",(req,res)=>res.sendFile(path.join(__dirname,"public","index.html")));
 app.listen(PORT,()=>console.log(`Manual SMM panel running on port ${PORT}`));
