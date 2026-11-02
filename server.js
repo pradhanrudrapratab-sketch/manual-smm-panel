@@ -230,13 +230,22 @@ app.post("/api/orders",auth,async(req,res)=>{
       body:JSON.stringify({amount:Number(amount.toFixed(2))})
     });
 
-    const payload=await response.json().catch(()=>({}));
+    const rawBody=await response.text();
+    let payload={};
+    try { payload=rawBody ? JSON.parse(rawBody) : {}; } catch {}
     const data=payload.data||payload;
     const purpose=data.purpose;
     const upiDeepLink=data.upi_deep_link;
 
-    if(!response.ok||!purpose||!upiDeepLink)
-      throw new Error(payload.message||data.message||"Payment provider rejected the request.");
+    if(!response.ok||!purpose||!upiDeepLink) {
+      console.error("FAMAPI create rejected:", {
+        httpStatus:response.status,
+        statusText:response.statusText,
+        contentType:response.headers.get("content-type"),
+        responseKeys:Object.keys(data||{})
+      });
+      throw new Error("Payment provider rejected the request.");
+    }
 
     const QRCode=require("qrcode");
     const qrUrl=await QRCode.toDataURL(upiDeepLink);
@@ -276,17 +285,48 @@ app.post("/api/orders/:id/verify",auth,async(req,res)=>{
       body:JSON.stringify({purpose:order.payment_order_id})
     });
 
-    const payload=await response.json().catch(()=>({}));
+    const rawBody=await response.text();
+    let payload={};
+    try { payload=rawBody ? JSON.parse(rawBody) : {}; } catch {}
     const data=payload.data||payload;
     const status=String(data.status||payload.status||"").toLowerCase();
     const returnedPurpose=data.purpose||payload.purpose;
 
+    // Amount is expected in rupees. Compare in integer paise.
+    const returnedAmount=data.amount ?? data.paid_amount ??
+      payload.amount ?? payload.paid_amount;
+    const returnedPaise=returnedAmount !== undefined &&
+      returnedAmount !== null && Number.isFinite(Number(returnedAmount))
+        ? Math.round(Number(returnedAmount)*100) : NaN;
+    const expectedPaise=Number(order.payment_amount);
+
+    const purposeMatches=
+      String(returnedPurpose||"")===String(order.payment_order_id);
+    const amountMatches=
+      Number.isSafeInteger(expectedPaise) &&
+      Number.isSafeInteger(returnedPaise) &&
+      returnedPaise===expectedPaise;
+
     const verified=response.ok &&
       status==="completed" &&
-      String(returnedPurpose||"")===String(order.payment_order_id);
+      purposeMatches &&
+      amountMatches;
 
-    if(!verified)
-      return res.json({verified:false,status:"pending",message:"Payment is not confirmed yet. Try again shortly."});
+    if(!verified) {
+      console.warn("FAMAPI verification not accepted:", {
+        httpStatus:response.status,
+        status,
+        responseKeys:Object.keys(data||{}),
+        purposeMatches,
+        amountPresent:returnedAmount!==undefined && returnedAmount!==null,
+        amountMatches
+      });
+      return res.json({
+        verified:false,
+        status:"pending",
+        message:"Payment is not confirmed yet. Try again shortly."
+      });
+    }
 
     db.prepare(`UPDATE orders SET payment_status='success',payment_utr=?,status='pending',updated_at=CURRENT_TIMESTAMP
       WHERE id=? AND payment_status!='success'`)
