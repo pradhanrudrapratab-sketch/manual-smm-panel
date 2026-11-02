@@ -148,7 +148,7 @@ const superAdmin = (req,res,next) => {
   return res.status(403).json({error:"Super Admin access required."});
 };
 function validUrl(v){ try { const u=new URL(v); return ["http:","https:"].includes(u.protocol); } catch { return false; } }
-function famapiHeaders(){ return { "Authorization":`Bearer ${process.env.FAMAPI_API_KEY || ""}`, "Content-Type":"application/json" }; }
+function famapiHeaders(){ return { "x-api-key":process.env.FAMAPI_API_KEY || "", "Content-Type":"application/json" }; }
 
 app.get("/api/health",(req,res)=>res.json({ok:true}));
 app.get("/api/me",(req,res)=>res.json({user:req.session.user || null}));
@@ -202,49 +202,102 @@ app.post("/api/orders",auth,async(req,res)=>{
   const {serviceId,targetLink,quantity}=req.body||{};
   const service=db.prepare("SELECT * FROM services WHERE id=? AND active=1").get(Number(serviceId));
   const qty=Number(quantity);
+
   if(!service) return res.status(404).json({error:"Service not found."});
   if(!validUrl(String(targetLink||""))) return res.status(400).json({error:"A valid target link is required before payment."});
   if(!Number.isInteger(qty)||qty<service.min_quantity||qty>service.max_quantity) return res.status(400).json({error:`Quantity must be between ${service.min_quantity} and ${service.max_quantity}.`});
   if(!process.env.FAMAPI_API_KEY) return res.status(503).json({error:"Payments are not configured yet. Please contact the administrator."});
+
   const amount=Math.round((qty/1000)*service.price_per_1000*100)/100;
-  const multiplier=Number(process.env.FAMAPI_AMOUNT_MULTIPLIER||100);
-  const paymentAmount=Math.round(amount*multiplier);
-  if(!Number.isFinite(paymentAmount)||paymentAmount<1) return res.status(400).json({error:"Order amount is invalid."});
+  const paymentAmount=Math.round(amount*100);
+
+  if(!Number.isFinite(amount)||amount<=0||!Number.isFinite(paymentAmount)||paymentAmount<1)
+    return res.status(400).json({error:"Order amount is invalid."});
+
   const tx=db.transaction(()=>{
     const info=db.prepare(`INSERT INTO orders(user_id,service_id,service_name,target_link,quantity,amount,payment_amount)
       VALUES(?,?,?,?,?,?,?)`).run(req.session.user.id,service.id,service.name,String(targetLink).trim(),qty,amount,paymentAmount);
     return Number(info.lastInsertRowid);
   });
+
   const orderId=tx();
+
   try{
-    const response=await fetch(`${(process.env.FAMAPI_BASE_URL||"https://mrkrishna.site/api/v1").replace(/\/$/,"")}/create-order`,{
-      method:"POST",headers:famapiHeaders(),body:JSON.stringify({amount:paymentAmount,note:`SMM Order #${orderId}`})
+    const base=(process.env.FAMAPI_BASE_URL||"https://famapi-clone-a4vn.vercel.app").replace(/\/$/,"");
+    const response=await fetch(`${base}/api/payment/create`,{
+      method:"POST",
+      headers:famapiHeaders(),
+      body:JSON.stringify({amount:Number(amount.toFixed(2))})
     });
-    const data=await response.json();
-    if(!response.ok || !data.id || !data.payment_link) throw new Error(data.message||"Payment provider rejected the request.");
-    db.prepare("UPDATE orders SET payment_order_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(data.id,orderId);
-    res.json({orderId,paymentLink:data.payment_link,qrUrl:data.qr_url||null,amount,order:data.id});
+
+    const payload=await response.json().catch(()=>({}));
+    const data=payload.data||payload;
+    const purpose=data.purpose;
+    const upiDeepLink=data.upi_deep_link;
+
+    if(!response.ok||!purpose||!upiDeepLink)
+      throw new Error(payload.message||data.message||"Payment provider rejected the request.");
+
+    const QRCode=require("qrcode");
+    const qrUrl=await QRCode.toDataURL(upiDeepLink);
+
+    db.prepare("UPDATE orders SET payment_order_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
+      .run(String(purpose),orderId);
+
+    return res.json({
+      orderId,
+      paymentLink:upiDeepLink,
+      qrUrl,
+      paymentReference:String(purpose),
+      amount
+    });
+
   }catch(e){
-    db.prepare("UPDATE orders SET payment_status='failed',status='payment_failed',updated_at=CURRENT_TIMESTAMP WHERE id=?").run(orderId);
-    res.status(502).json({error:"Could not create payment. No order was submitted for fulfilment."});
+    console.error("FAMAPI create payment error:",e.message);
+    db.prepare("UPDATE orders SET payment_status='failed',status='payment_failed',updated_at=CURRENT_TIMESTAMP WHERE id=?")
+      .run(orderId);
+    return res.status(502).json({error:"Could not create payment. No order was submitted for fulfilment."});
   }
 });
+
 app.post("/api/orders/:id/verify",auth,async(req,res)=>{
-  const order=db.prepare("SELECT * FROM orders WHERE id=? AND user_id=?").get(Number(req.params.id),req.session.user.id);
+  const order=db.prepare("SELECT * FROM orders WHERE id=? AND user_id=?")
+    .get(Number(req.params.id),req.session.user.id);
+
   if(!order)return res.status(404).json({error:"Order not found."});
   if(order.payment_status==="success")return res.json({verified:true,status:order.status});
-  if(!order.payment_order_id)return res.status(400).json({error:"Payment order is not available."});
+  if(!order.payment_order_id)return res.status(400).json({error:"Payment reference is not available."});
+
   try{
-    const response=await fetch(`${(process.env.FAMAPI_BASE_URL||"https://mrkrishna.site/api/v1").replace(/\/$/,"")}/orders/${encodeURIComponent(order.payment_order_id)}`,{headers:famapiHeaders()});
-    const payload=await response.json();
-    const d=payload.data||{};
-    const verified=response.ok && payload.status==="success" && d.status==="COMPLETED" &&
-      String(d.order_id)===String(order.payment_order_id) && Number(d.amount)===Number(order.payment_amount);
-    if(!verified)return res.json({verified:false,status:"pending",message:"Payment is not confirmed yet. Try again shortly."});
+    const base=(process.env.FAMAPI_BASE_URL||"https://famapi-clone-a4vn.vercel.app").replace(/\/$/,"");
+    const response=await fetch(`${base}/api/payment/verify`,{
+      method:"POST",
+      headers:famapiHeaders(),
+      body:JSON.stringify({purpose:order.payment_order_id})
+    });
+
+    const payload=await response.json().catch(()=>({}));
+    const data=payload.data||payload;
+    const status=String(data.status||payload.status||"").toLowerCase();
+    const returnedPurpose=data.purpose||payload.purpose;
+
+    const verified=response.ok &&
+      status==="completed" &&
+      String(returnedPurpose||"")===String(order.payment_order_id);
+
+    if(!verified)
+      return res.json({verified:false,status:"pending",message:"Payment is not confirmed yet. Try again shortly."});
+
     db.prepare(`UPDATE orders SET payment_status='success',payment_utr=?,status='pending',updated_at=CURRENT_TIMESTAMP
-      WHERE id=? AND payment_status!='success'`).run(d.utr||null,order.id);
-    res.json({verified:true,status:"pending"});
-  }catch(e){res.status(502).json({error:"Unable to verify payment right now. Please retry."});}
+      WHERE id=? AND payment_status!='success'`)
+      .run(data.utr||data.transaction_id||null,order.id);
+
+    return res.json({verified:true,status:"pending"});
+
+  }catch(e){
+    console.error("FAMAPI verify payment error:",e.message);
+    return res.status(502).json({error:"Unable to verify payment right now. Please retry."});
+  }
 });
 app.get("/api/orders",auth,(req,res)=>{
   const canManage = req.session.user.role === "super_admin" ||
